@@ -13,6 +13,19 @@ export type WithEntry = {
 }
 
 /**
+ * A whereHas subquery whose related entity's global scopes have not been
+ * applied yet. `conditions` is the EXISTS' own condition group, already wired
+ * into the outer statement; `constraints` is the live group the sub-query
+ * writes its conditions into, attached to `conditions` only once it is known to
+ * hold something (an empty group would compile to an empty `()`).
+ */
+type PendingRelationQuery = {
+  query: EntityQuery<any>
+  conditions: ConditionGroup
+  constraints: ConditionGroup
+}
+
+/**
  * Chainable query builder for Entities. Wraps DataTable and hydrates rows
  * into typed entity instances when a terminal method is called.
  *
@@ -25,6 +38,14 @@ export class EntityQuery<T> {
   private _scopesApplied = false
   private _excludedScopes: Set<string> = new Set()
   private _skipAllScopes = false
+  /**
+   * Subqueries built by whereHas/orWhereHas, waiting for their own entity's
+   * global scopes. They cannot be resolved when the EXISTS is built, because
+   * whereHas is a synchronous chainable and a scope may be asynchronous — so
+   * they are held here and resolved by _applyGlobalScopes, which already runs
+   * (once, awaited) right before the statement is compiled. See _applyWhereHas.
+   */
+  private _pendingRelationQueries: PendingRelationQuery[] = []
 
   constructor(repository: EntityRepository<T>, table: DataTable) {
     this._repository = repository
@@ -75,6 +96,42 @@ export class EntityQuery<T> {
     for (const [name, scopeFn] of scopes) {
       if (!this._excludedScopes.has(name)) {
         await scopeFn(this)
+      }
+    }
+
+    await this._resolvePendingRelationQueries()
+  }
+
+  /**
+   * Applies the pending whereHas subqueries' own global scopes and folds their
+   * conditions into the EXISTS that is already part of this statement.
+   *
+   * This is what makes `whereHas('posts')` mean "has posts that are visible to
+   * you" rather than "has a row in the posts table": a global scope states an
+   * invariant about the entity, so a relation constraint has to honour it the
+   * same way a direct query does — and the same way `with()` already does when
+   * it eager-loads that relation. A callback that wants the raw table opts out
+   * from inside, with the sub-query's own `withoutGlobalScope(s)`.
+   *
+   * Resolution is recursive: applying a sub-query's scopes resolves ITS pending
+   * subqueries in turn, so a nested whereHas is scoped at every level.
+   */
+  private async _resolvePendingRelationQueries(): Promise<void> {
+    // Drained rather than iterated: a scope is free to add another whereHas,
+    // and that one has to be resolved too.
+    while (this._pendingRelationQueries.length > 0) {
+      const pending = this._pendingRelationQueries.splice(0)
+
+      for (const { query, conditions, constraints } of pending) {
+        await query._applyGlobalScopes()
+
+        // Attached now, not when the EXISTS was built: the group is nested so
+        // the correlated column condition stays AND-ed with the whole user
+        // expression (an `orWhere` inside the callback must not swallow it),
+        // and top-level AND order carries no meaning, so appending is safe.
+        if (constraints.getConditions().length > 0) {
+          conditions.where(constraints)
+        }
       }
     }
   }
@@ -159,15 +216,22 @@ export class EntityQuery<T> {
     }
 
     // Build the top-level condition group for the subquery.
-    // If the user callback added conditions, wrap them in a nested group so that
-    // the correlated column condition is always AND-ed with the entire user expression
-    // (prevents SQL precedence bugs when the callback uses orWhere).
+    //
+    // The callback's own conditions are NOT folded in here: the related entity's
+    // global scopes still have to be applied to `subEntityQuery`, and a scope
+    // may be asynchronous while this method is a synchronous chainable. So the
+    // sub-query is registered as pending and _resolvePendingRelationQueries
+    // attaches its conditions later, from the terminal method — before the
+    // statement is compiled, and wrapped in a nested group so the correlated
+    // column condition stays AND-ed with the entire user expression (which
+    // prevents SQL precedence bugs when the callback uses orWhere).
     const subConditions = new ConditionGroup()
-    const userConditions = subTable.getWhereConditions()
 
-    if (userConditions.getConditions().length > 0) {
-      subConditions.where(userConditions)
-    }
+    this._pendingRelationQueries.push({
+      query: subEntityQuery,
+      conditions: subConditions,
+      constraints: subTable.getWhereConditions()
+    })
 
     // Add the correlated join condition at the top level (always AND).
     if (rel.type === 'hasOne' || rel.type === 'hasMany') {

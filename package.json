@@ -1,6 +1,6 @@
 {
   "name": "@neogroup/neorm",
-  "version": "0.0.46",
+  "version": "0.0.47",
   "description": "Database connector and ORM for javascript",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
